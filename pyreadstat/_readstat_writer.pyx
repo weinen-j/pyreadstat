@@ -28,7 +28,9 @@ import numpy as np
 import narwhals.stable.v2 as nw
 
 from .readstat_api cimport *
-from libc.errno cimport errno
+from libc.errno cimport errno, EIO
+from libc.stdlib cimport malloc, free
+from libc.string cimport memcpy
 from ._readstat_parser import ReadstatError, PyreadstatError
 from ._readstat_parser cimport check_exit_status
 
@@ -56,6 +58,7 @@ cdef valid_user_missing_sas = [chr(x) for x in range(ord("A"), ord("Z")+1)] + ["
 cdef valid_user_missing_stata = [chr(x) for x in range(ord("a"), ord("z")+1)]
 
 # max lenght of a string in dta before it has to use string_ref
+cdef bint IS_WINDOWS = os.name == "nt"
 cdef int dta_old_max_width = 128
 cdef int dta_111_max_width = 244
 cdef int dta_117_max_width = 2045
@@ -572,16 +575,65 @@ cdef void set_variable_measure(readstat_variable_t *variable, str measure_str, s
     readstat_variable_set_measure(variable, measure);
 
 
+cdef int write_all(write_ctx_t *ctx, const char *data, size_t _len) noexcept:
+    """
+    write all of data to the file descriptor, retrying short writes.
+    Returns 0 on success; on failure records errno in ctx.error and returns -1
+    """
+    cdef ssize_t written
+    while _len > 0:
+        if IS_WINDOWS:
+            written = _write(ctx.fd, data, _len)
+        else:
+            written = write(ctx.fd, data, _len)
+        if written <= 0:
+            ctx.error = errno if errno else EIO
+            return -1
+        data += written
+        _len -= written
+    return 0
+
+cdef int flush_buffer(write_ctx_t *ctx) noexcept:
+    """
+    write out whatever the buffer holds. Returns 0 on success, -1 on failure
+    """
+    if ctx.error:
+        return -1
+    if ctx.used == 0:
+        return 0
+    if write_all(ctx, ctx.buf, ctx.used) != 0:
+        return -1
+    ctx.used = 0
+    return 0
+
 cdef ssize_t write_bytes(const void *data, size_t _len, void *ctx) noexcept:
     """
-    for the writer an explicit function to write must be defined 
+    for the writer an explicit function to write must be defined.
+
+    ReadStat calls this for every piece of the file as it produces it -- under
+    SPSS row compression that is 8 bytes at a time -- so writing each piece
+    straight to the descriptor costs one system call per piece, and on a
+    network share one synchronous round trip per piece (a 0.5 MB sav took
+    over half an hour to a share 33 ms away). The pieces are collected in a
+    WRITE_BUFFER_SIZE buffer instead. ReadStat's writer only ever appends
+    (it has no seek callback), so the bytes reach the file in the same order.
+
+    On failure this returns 0, not -1: ReadStat keeps the result in a size_t
+    and checks it with bytes_written < len, so -1 would read as success.
     """
-    cdef int fd
-    fd = (<int *>ctx)[0]
-    if os.name=='nt':
-        return _write(fd, data, _len)
-    else:
-        return write(fd, data, _len)
+    cdef write_ctx_t *wctx = <write_ctx_t *>ctx
+    if wctx.error:
+        return 0
+    if wctx.used + _len > WRITE_BUFFER_SIZE:
+        if flush_buffer(wctx) != 0:
+            return 0
+    if _len >= WRITE_BUFFER_SIZE:
+        if write_all(wctx, <const char *>data, _len) != 0:
+            return 0
+        return _len
+    memcpy(wctx.buf + wctx.used, data, _len)
+    wctx.used += _len
+    return _len
 
 cdef int open_file(bytes filename_bytes):
 
@@ -774,6 +826,16 @@ cdef int run_write(df, object filename_path, dst_file_format file_format, str fi
             "Could not open file '%s' for writing: %s (errno %d). "
             "The file may be locked by another process or you may not have write permission."
             % (os.fsdecode(filename_bytes), os.strerror(errno), errno))
+
+    cdef write_ctx_t wctx
+    wctx.fd = fd
+    wctx.used = 0
+    wctx.error = 0
+    wctx.buf = <char *>malloc(WRITE_BUFFER_SIZE)
+    if wctx.buf == NULL:
+        close_file(fd)
+        raise MemoryError("Could not allocate the write buffer")
+
     writer = readstat_writer_init()
 
     try:
@@ -897,17 +959,17 @@ cdef int run_write(df, object filename_path, dst_file_format file_format, str fi
 
         # start writing
         if file_format == FILE_FORMAT_SAS7BCAT:
-            check_exit_status(readstat_begin_writing_sas7bcat(writer, &fd))
+            check_exit_status(readstat_begin_writing_sas7bcat(writer, &wctx))
         elif file_format == FILE_FORMAT_DTA:
-            check_exit_status(readstat_begin_writing_dta(writer, &fd, row_count))
+            check_exit_status(readstat_begin_writing_dta(writer, &wctx, row_count))
         elif file_format == FILE_FORMAT_SAV:
-            check_exit_status(readstat_begin_writing_sav(writer, &fd, row_count))
+            check_exit_status(readstat_begin_writing_sav(writer, &wctx, row_count))
         elif file_format == FILE_FORMAT_POR:
-            check_exit_status(readstat_begin_writing_por(writer, &fd, row_count))
+            check_exit_status(readstat_begin_writing_por(writer, &wctx, row_count))
         elif file_format == FILE_FORMAT_SAS7BDAT:
-            check_exit_status(readstat_begin_writing_sas7bdat(writer, &fd, row_count))
+            check_exit_status(readstat_begin_writing_sas7bdat(writer, &wctx, row_count))
         elif file_format == FILE_FORMAT_XPORT:
-            check_exit_status(readstat_begin_writing_xport(writer, &fd, row_count))
+            check_exit_status(readstat_begin_writing_xport(writer, &wctx, row_count))
         else:
             raise PyreadstatError("unknown file format")
 
@@ -995,12 +1057,26 @@ cdef int run_write(df, object filename_path, dst_file_format file_format, str fi
             rowcnt += 1
 
         check_exit_status(readstat_end_writing(writer))
+        # whatever is still in the buffer has not reached the file yet
+        flush_buffer(&wctx)
 
-    except:
+    except ReadstatError:
+        # a failed write surfaces from ReadStat as a bare "Unable to write
+        # data"; the errno says why (disk full, network share gone, ...)
+        if wctx.error:
+            raise PyreadstatError(
+                "Could not write to file '%s': %s (errno %d)"
+                % (os.fsdecode(filename_bytes), os.strerror(wctx.error), wctx.error))
         raise
     finally:
         readstat_writer_free(writer)
+        free(wctx.buf)
         close_file(fd)
+
+    if wctx.error:
+        raise PyreadstatError(
+            "Could not write to file '%s': %s (errno %d)"
+            % (os.fsdecode(filename_bytes), os.strerror(wctx.error), wctx.error))
 
     return 0
 

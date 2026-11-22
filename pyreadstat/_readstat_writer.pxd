@@ -83,7 +83,19 @@ cdef char * get_datetimelike_format_for_readstat(dst_file_format file_format, py
 cdef int get_narwhals_str_series_max_length(object series, dict value_labels, bint isobject)
 cdef int check_series_all_same_types(object series, object type_to_check)
 cdef list get_narwhals_column_types(object df, dict missing_user_values, dict variable_value_labels, int dta_str_max_len)
-cdef ssize_t write_bytes(const void *data, size_t _len, void *ctx)
+# the writer collects ReadStat's output here and writes it out in blocks
+cdef enum:
+    WRITE_BUFFER_SIZE = 1048576
+
+ctypedef struct write_ctx_t:
+    int fd
+    char *buf
+    size_t used
+    int error  # errno of the first failed write, 0 while all is well
+
+cdef int write_all(write_ctx_t *ctx, const char *data, size_t _len) noexcept
+cdef int flush_buffer(write_ctx_t *ctx) noexcept
+cdef ssize_t write_bytes(const void *data, size_t _len, void *ctx) noexcept
 #cdef void check_exit_status(readstat_error_t retcode) except *
 cdef int open_file(bytes filename_path)
 cdef int close_file(int fd)

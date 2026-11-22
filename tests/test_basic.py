@@ -737,6 +737,40 @@ class TestBasic(unittest.TestCase):
         os.remove(os.path.expanduser(path))
         self.assertTrue(df.equals(self.df_pandas))
 
+    def test_write_larger_than_write_buffer(self):
+        # every writer collects its output in a 1 MB buffer; a file several
+        # times that size must come back intact across the flushes in between.
+        # Values are multiples of 1/8 so that every format holds them exactly
+        # (por writes base-30 text, xport IBM floats)
+        rng = np.random.default_rng(0)
+        n = 80000
+        df = pd.DataFrame({
+            "a": rng.integers(0, 8000000, n) / 8, "b": rng.integers(0, 8000000, n) / 8,
+            "c": rng.integers(0, 8000000, n) / 8,
+            "small": rng.integers(1, 5, n).astype(float),
+            "txt": rng.choice(["alpha", "beta", "gamma"], n),
+        })
+        sav_zlib = lambda d, p: pyreadstat.write_sav(d, p, compress=True)
+        sas_rle = lambda d, p: pyreadstat.write_sas7bdat(d, p, row_compress=True)
+        cases = [
+            # name, writer, reader, at least this many bytes on disk
+            ("big.sav", pyreadstat.write_sav, pyreadstat.read_sav, 2 * 1048576),
+            ("big.zsav", sav_zlib, pyreadstat.read_sav, 0),
+            ("big.dta", pyreadstat.write_dta, pyreadstat.read_dta, 2 * 1048576),
+            ("big.por", pyreadstat.write_por, pyreadstat.read_por, 2 * 1048576),
+            ("big.xpt", pyreadstat.write_xport, pyreadstat.read_xport, 2 * 1048576),
+            ("big.sas7bdat", pyreadstat.write_sas7bdat, pyreadstat.read_sas7bdat, 2 * 1048576),
+            ("big_rle.sas7bdat", sas_rle, pyreadstat.read_sas7bdat, 0),
+        ]
+        for name, writer, reader, min_size in cases:
+            with self.subTest(name):
+                path = os.path.join(self.write_folder, name)
+                writer(df, path)
+                self.assertGreaterEqual(os.path.getsize(path), min_size)
+                back, _ = reader(path)
+                back.columns = [x.lower() for x in back.columns]
+                self.assertTrue(back.equals(df))
+
     def test_zsav_write_basic(self):
         file_label = "basic write"
         file_note = "These are some notes"

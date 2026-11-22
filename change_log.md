@@ -1,3 +1,13 @@
+# unreleased
+* Writers buffer their output and write it in 1 MB blocks instead of passing
+  each piece Readstat produces straight to the file (8 bytes at a time for
+  row-compressed sav). On a network share each of those pieces was a
+  synchronous round trip: a 0.5 MB sav took over half an hour to a share
+  33 ms away over VPN, against half a second to write it locally.
+* A failed write (disk full, network share gone) now raises a PyreadstatError
+  naming the cause. Before, the -1 from the write call read as success to
+  Readstat and the error went unnoticed.
+
 # 1.3.8 (github, pypi and conda 2026.11.14)
 * Updated Readstat sources to f1f68265303e3592c811fc103cd5002eb69fbf7c
 * XPORT, sas7bdat and sas7bcat formats and informats without decimals now end with a dot
